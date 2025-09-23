@@ -351,7 +351,7 @@ if df_raw is not None:
             .encode(
                 x=alt.X(
                     "dispatcher_name:N",
-                    sort=alt.SortField(field="bids", order="descending", aggregate="sum"),
+                    sort=alt.SortField(field="bids", order="descending"),
                     title="Диспетчер",
                 ),
                 y=alt.Y("sum(bids):Q", stack="zero", title="Количество ставок"),
