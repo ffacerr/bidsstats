@@ -5,13 +5,13 @@ Streamlit-приложение для аналитики ставок диспе
 Функции:
 - Загрузка CSV/TSV/XLSX.
 - Автодетект разделителя.
-- Перевод времени из UTC в America/New_York (NYC), добавление дат по NY.
+- Перевод времени из UTC в America/New_York (NYC), добавление дат по NY (опционально).
 - Подсчёт по каждому диспетчеру и по каждому водителю:
     * количество ставок;
     * средний профит (Dispatcher Price - Driver Price);
     * средняя цена водителя за милю (Driver Price / Total Miles);
 - Сводка по каждому диспетчеру (общее количество ставок и др.).
-- Фильтры по дате (NY), диспетчерам и минимальному числу ставок.
+- Фильтры по дате (NY), диспетчерам, минимальному числу ставок и максимальной средней цене водителя за милю.
 - Графики: количество ставок по диспетчерам, средний профит по диспетчерам,
   scatter по парам диспетчер-водитель (avg profit vs avg $/mile),
   таймсерия среднего профита по дням.
@@ -32,39 +32,30 @@ import altair as alt
 
 st.set_page_config(page_title="Dispatcher Bids Analytics", layout="wide")
 st.title("📊 Статистика ставок диспетчеров")
-st.caption("Время в источнике считается UTC. В отчёте все даты/время конвертируются в таймзону New York (America/New_York).")
+st.caption(
+    "По умолчанию время конвертируется из UTC в таймзону New York (America/New_York)."
+    " Эту опцию можно отключить в настройках, если данные уже в нужной зоне."
+)
 
 # ----------------------------
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ----------------------------
 
-REQUIRED_COLS = [
-    "Created At",
-    "Event At",
-    "Dispatcher ID",
-    "Dispatcher Name",  # email диспетчера
-    "Unit",
-    "Driver Name",
-    "Total Miles",
-    "Broker",
-    "Driver Price",
-    "Dispatcher Price",
-    "User Dispatch ID",
-]
-
-DISPLAY_COL_RENAME = {
-    "Created At": "created_at_utc",
-    "Event At": "event_at_utc",
-    "Dispatcher ID": "dispatcher_id",
-    "Dispatcher Name": "dispatcher_name",  # email
-    "Unit": "unit",
-    "Driver Name": "driver_name",
-    "Total Miles": "total_miles",
-    "Broker": "broker",
-    "Driver Price": "driver_price",
-    "Dispatcher Price": "dispatcher_price",
-    "User Dispatch ID": "user_dispatch_id",
+COLUMN_ALIASES = {
+    "created_at_original": ["Created At", "Created At (America/New_York)"],
+    "event_at_original": ["Event At", "Event At (America/New_York)"],
+    "dispatcher_id": ["Dispatcher ID"],
+    "dispatcher_name": ["Dispatcher Name"],  # email
+    "unit": ["Unit"],
+    "driver_name": ["Driver Name"],
+    "total_miles": ["Total Miles"],
+    "broker": ["Broker"],
+    "driver_price": ["Driver Price"],
+    "dispatcher_price": ["Dispatcher Price"],
+    "user_dispatch_id": ["User Dispatch ID"],
 }
+
+REQUIRED_COLS = list(COLUMN_ALIASES.keys())
 
 NY_TZ = "America/New_York"
 
@@ -79,23 +70,26 @@ def load_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     return df
 
 @st.cache_data(show_spinner=False)
-def preprocess(df_in: pd.DataFrame) -> pd.DataFrame:
+def preprocess(df_in: pd.DataFrame, convert_time: bool) -> pd.DataFrame:
     df = df_in.copy()
 
     # Переименуем, приведём к базовым именам
     # Попробуем сделать case-insensitive сопоставление колонок
     cols_map = {}
     lower_map = {c.lower().strip(): c for c in df.columns}
-    for k in REQUIRED_COLS:
-        lk = k.lower()
-        if lk in lower_map:
-            cols_map[lower_map[lk]] = DISPLAY_COL_RENAME[k]
+    for dest, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            lk = alias.lower().strip()
+            if lk in lower_map:
+                cols_map[lower_map[lk]] = dest
+                break
     df = df.rename(columns=cols_map)
 
     # Проверим обязательные
-    missing = [DISPLAY_COL_RENAME[c] for c in REQUIRED_COLS if DISPLAY_COL_RENAME[c] not in df.columns]
+    missing = [dest for dest in REQUIRED_COLS if dest not in df.columns]
     if missing:
-        raise ValueError(f"В файле отсутствуют обязательные колонки: {missing}")
+        missing_display = [COLUMN_ALIASES[m][0] for m in missing]
+        raise ValueError(f"В файле отсутствуют обязательные колонки: {missing_display}")
 
     # Числа
     for c in ["total_miles", "driver_price", "dispatcher_price"]:
@@ -108,11 +102,27 @@ def preprocess(df_in: pd.DataFrame) -> pd.DataFrame:
         )
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Время: считаем, что в исходнике UTC (как указал пользователь)
-    # pandas to_datetime(..., utc=True) трактует naive как UTC и добавляет tzinfo
-    for tcol_src, tcol_dst in [("created_at_utc", "created_at_ny"), ("event_at_utc", "event_at_ny")]:
-        ts = pd.to_datetime(df[tcol_src], errors="coerce", utc=True)
-        df[tcol_dst] = ts.dt.tz_convert(NY_TZ)
+    # Время: по желанию конвертируем из UTC в America/New_York
+    if convert_time:
+        created_utc = pd.to_datetime(df["created_at_original"], errors="coerce", utc=True)
+        event_utc = pd.to_datetime(df["event_at_original"], errors="coerce", utc=True)
+        df["created_at_original"] = created_utc
+        df["event_at_original"] = event_utc
+        df["created_at_ny"] = created_utc.dt.tz_convert(NY_TZ)
+        df["event_at_ny"] = event_utc.dt.tz_convert(NY_TZ)
+    else:
+        def _ensure_ny(series: pd.Series) -> pd.Series:
+            tz_info = series.dt.tz
+            if tz_info is None:
+                return series.dt.tz_localize(NY_TZ, nonexistent="NaT", ambiguous="NaT")
+            return series.dt.tz_convert(NY_TZ)
+
+        created_local = pd.to_datetime(df["created_at_original"], errors="coerce")
+        event_local = pd.to_datetime(df["event_at_original"], errors="coerce")
+        df["created_at_original"] = created_local
+        df["event_at_original"] = event_local
+        df["created_at_ny"] = _ensure_ny(created_local)
+        df["event_at_ny"] = _ensure_ny(event_local)
 
     # Дата по Нью-Йорку (для группировок/фильтров)
     df["date_ny"] = df["created_at_ny"].dt.date
@@ -188,6 +198,13 @@ with st.sidebar:
     up = st.file_uploader("Загрузите CSV/TSV/XLSX с логами", type=["csv", "tsv", "txt", "xlsx", "xls"])
 
     st.divider()
+    convert_time = st.checkbox(
+        "Конвертировать время в America/New_York",
+        value=True,
+        help="Отключите, если в выгрузке уже указано время по Нью-Йорку.",
+    )
+
+    st.divider()
     st.subheader("Фильтры")
     min_bids_pair = st.number_input("Минимум ставок для пары диспетчер-водитель", min_value=1, max_value=100, value=1, step=1)
 
@@ -207,7 +224,7 @@ if df_raw is not None:
 
     # Предобработка
     try:
-        df = preprocess(df_raw)
+        df = preprocess(df_raw, convert_time=convert_time)
     except Exception as e:
         st.error(f"Ошибка предобработки: {e}")
         st.stop()
@@ -231,6 +248,41 @@ if df_raw is not None:
         df = df.loc[m].copy()
     if selected_dispatchers:
         df = df[df["dispatcher_name"].isin(selected_dispatchers)].copy()
+
+    if df.empty:
+        st.warning("После применения фильтров данных не осталось.")
+        st.stop()
+
+    # Фильтр по средней цене водителя за милю
+    driver_avg_ppm = df.groupby("driver_name")["driver_price_per_mile"].mean()
+    valid_driver_avg_ppm = driver_avg_ppm.dropna()
+    with st.sidebar:
+        if not valid_driver_avg_ppm.empty:
+            default_limit = float(valid_driver_avg_ppm.max())
+            default_limit = float(np.ceil(default_limit * 100) / 100)
+            max_driver_ppm = st.number_input(
+                "Максимальная средняя цена водителя за милю ($/mile)",
+                min_value=0.0,
+                value=default_limit,
+                step=0.1,
+                format="%.2f",
+                help="Значение считается по каждому водителю (Driver Price / Total Miles).",
+            )
+        else:
+            st.number_input(
+                "Максимальная средняя цена водителя за милю ($/mile)",
+                min_value=0.0,
+                value=0.0,
+                step=0.1,
+                format="%.2f",
+                help="Значение считается по каждому водителю (Driver Price / Total Miles).",
+                disabled=True,
+            )
+            max_driver_ppm = None
+
+    if max_driver_ppm is not None and not valid_driver_avg_ppm.empty:
+        allowed_drivers = driver_avg_ppm[driver_avg_ppm.isna() | (driver_avg_ppm <= max_driver_ppm)].index
+        df = df[df["driver_name"].isin(allowed_drivers) | df["driver_name"].isna()].copy()
 
     if df.empty:
         st.warning("После применения фильтров данных не осталось.")
@@ -263,9 +315,9 @@ if df_raw is not None:
     st.dataframe(agg_pair, use_container_width=True)
     st.download_button("⬇️ Скачать сводку по парам (CSV)", data=df_to_csv_bytes(agg_pair), file_name="dispatcher_driver_pairs.csv", mime="text/csv")
 
-    with st.expander("Детализированный журнал с конвертированным временем (NY)"):
+    with st.expander("Детализированный журнал с исходным и NY-временем"):
         cols_show = [
-            "created_at_utc",
+            "created_at_original",
             "created_at_ny",
             "dispatcher_name",
             "unit",
@@ -291,18 +343,32 @@ if df_raw is not None:
     # ----------------------------
     st.subheader("Визуализации")
 
-    # 1) Кол-во ставок по диспетчерам
-    chart_bids = (
-        alt.Chart(agg_disp)
-        .mark_bar()
-        .encode(
-            x=alt.X("dispatcher_name:N", sort="-y", title="Диспетчер"),
-            y=alt.Y("total_bids:Q", title="Количество ставок"),
-            tooltip=["dispatcher_name", "total_bids", "unique_drivers", "avg_profit", "total_profit"],
+    # 1) Кол-во ставок по диспетчерам (стек по водителям)
+    if not agg_pair.empty:
+        chart_bids = (
+            alt.Chart(agg_pair)
+            .mark_bar()
+            .encode(
+                x=alt.X(
+                    "dispatcher_name:N",
+                    sort=alt.SortField(field="bids", order="descending", aggregate="sum"),
+                    title="Диспетчер",
+                ),
+                y=alt.Y("sum(bids):Q", stack="zero", title="Количество ставок"),
+                color=alt.Color("driver_name:N", title="Водитель"),
+                tooltip=[
+                    alt.Tooltip("dispatcher_name:N", title="Диспетчер"),
+                    alt.Tooltip("driver_name:N", title="Водитель"),
+                    alt.Tooltip("bids:Q", title="Ставок"),
+                    alt.Tooltip("avg_profit:Q", title="Avg профит", format=".2f"),
+                    alt.Tooltip("avg_driver_ppm:Q", title="Avg $/mile", format=".2f"),
+                ],
+            )
+            .properties(height=320)
         )
-        .properties(height=320)
-    )
-    st.altair_chart(chart_bids, use_container_width=True)
+        st.altair_chart(chart_bids, use_container_width=True)
+    else:
+        st.info("Недостаточно данных для построения распределения ставок по водителям.")
 
     # 2) Средний профит по диспетчерам
     chart_profit = (
