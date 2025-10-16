@@ -190,6 +190,26 @@ def aggregate_tables(df: pd.DataFrame, min_bids_pair: int = 1):
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
+
+def filter_non_positive_profit(df: pd.DataFrame) -> pd.DataFrame:
+    """Возвращает копию датафрейма только с положительным профитом."""
+
+    return df[df["profit"] > 0].copy()
+
+
+def filter_pairs_by_driver_ppm_limit(
+    agg_pair: pd.DataFrame, max_driver_ppm: float
+) -> pd.DataFrame:
+    """Фильтрует агрегированные пары диспетчер-водитель по ограничению $/mile."""
+
+    if agg_pair.empty:
+        return agg_pair
+
+    mask = agg_pair["avg_driver_ppm"].isna() | (
+        agg_pair["avg_driver_ppm"] <= max_driver_ppm
+    )
+    return agg_pair.loc[mask].copy()
+
 # ----------------------------
 # Сайдбар: загрузка и настройки
 # ----------------------------
@@ -207,6 +227,11 @@ with st.sidebar:
     st.divider()
     st.subheader("Фильтры")
     min_bids_pair = st.number_input("Минимум ставок для пары диспетчер-водитель", min_value=1, max_value=100, value=1, step=1)
+    exclude_non_positive_profit = st.checkbox(
+        "Не учитывать ставки с неположительным профитом",
+        value=False,
+        help="При включении из расчётов исключаются ставки с профитом ≤ 0.",
+    )
 
 # ----------------------------
 # Загрузка данных
@@ -249,11 +274,15 @@ if df_raw is not None:
     if selected_dispatchers:
         df = df[df["dispatcher_name"].isin(selected_dispatchers)].copy()
 
+    if exclude_non_positive_profit:
+        df = filter_non_positive_profit(df)
+
     if df.empty:
         st.warning("После применения фильтров данных не осталось.")
         st.stop()
 
     # Фильтр по средней цене водителя за милю
+    df_for_pair_scatter = df.copy()
     driver_avg_ppm = df.groupby("driver_name")["driver_price_per_mile"].mean()
     valid_driver_avg_ppm = driver_avg_ppm.dropna()
     with st.sidebar:
@@ -290,6 +319,13 @@ if df_raw is not None:
 
     # Агрегации
     agg_pair, agg_disp, daily = aggregate_tables(df, min_bids_pair=min_bids_pair)
+    scatter_pair_data, _, _ = aggregate_tables(
+        df_for_pair_scatter, min_bids_pair=min_bids_pair
+    )
+    if max_driver_ppm is not None:
+        scatter_pair_data = filter_pairs_by_driver_ppm_limit(
+            scatter_pair_data, max_driver_ppm
+        )
 
     # ----------------------------
     # КЛЮЧЕВЫЕ СВОДКИ
@@ -384,9 +420,9 @@ if df_raw is not None:
     st.altair_chart(chart_profit, use_container_width=True)
 
     # 3) Scatter по парам: avg $/mile vs avg profit, размер = кол-во ставок
-    if not agg_pair.empty:
+    if not scatter_pair_data.empty:
         chart_scatter = (
-            alt.Chart(agg_pair)
+            alt.Chart(scatter_pair_data)
             .mark_circle()
             .encode(
                 x=alt.X("avg_driver_ppm:Q", title="Средняя цена водителя за милю ($/mile)"),
