@@ -399,26 +399,39 @@ if df_raw is not None:
 
     # 3) Scatter по парам: avg $/mile vs avg profit, размер = кол-во ставок
     if not agg_pair.empty:
-        chart_scatter = (
-            alt.Chart(agg_pair)
-            .mark_circle()
-            .encode(
-                x=alt.X("avg_driver_ppm:Q", title="Средняя цена водителя за милю ($/mile)"),
-                y=alt.Y("avg_profit:Q", title="Средний профит"),
-                size=alt.Size("bids:Q", title="Ставок"),
-                color=alt.Color("dispatcher_name:N", title="Диспетчер"),
-                tooltip=[
-                    "dispatcher_name",
-                    "driver_name",
-                    "bids",
-                    alt.Tooltip("avg_driver_ppm:Q", title="$ водителя/миля", format=".2f"),
-                    alt.Tooltip("avg_profit:Q", title="Avg профит", format=".2f"),
-                    alt.Tooltip("total_miles:Q", title="Всего миль", format=".0f"),
-                ],
+        scatter_data = agg_pair.copy()
+        if max_driver_ppm is not None:
+            scatter_data = scatter_data[
+                scatter_data["avg_driver_ppm"].isna()
+                | (scatter_data["avg_driver_ppm"] <= max_driver_ppm)
+            ]
+
+        if scatter_data.empty:
+            st.info(
+                "После применения фильтра по максимальной средней цене за милю "
+                "не осталось подходящих пар диспетчер-водитель."
             )
-            .properties(height=380)
-        )
-        st.altair_chart(chart_scatter, use_container_width=True)
+        else:
+            chart_scatter = (
+                alt.Chart(scatter_data)
+                .mark_circle()
+                .encode(
+                    x=alt.X("avg_driver_ppm:Q", title="Средняя цена водителя за милю ($/mile)"),
+                    y=alt.Y("avg_profit:Q", title="Средний профит"),
+                    size=alt.Size("bids:Q", title="Ставок"),
+                    color=alt.Color("dispatcher_name:N", title="Диспетчер"),
+                    tooltip=[
+                        "dispatcher_name",
+                        "driver_name",
+                        "bids",
+                        alt.Tooltip("avg_driver_ppm:Q", title="$ водителя/миля", format=".2f"),
+                        alt.Tooltip("avg_profit:Q", title="Avg профит", format=".2f"),
+                        alt.Tooltip("total_miles:Q", title="Всего миль", format=".0f"),
+                    ],
+                )
+                .properties(height=380)
+            )
+            st.altair_chart(chart_scatter, use_container_width=True)
 
     # 4) Таймсерия: средний профит по дням (NY), раскраска по диспетчерам
     if not daily.empty:
