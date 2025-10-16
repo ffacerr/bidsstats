@@ -190,6 +190,12 @@ def aggregate_tables(df: pd.DataFrame, min_bids_pair: int = 1):
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
+
+def filter_non_positive_profit(df: pd.DataFrame) -> pd.DataFrame:
+    """Возвращает копию датафрейма только с положительным профитом."""
+
+    return df[df["profit"] > 0].copy()
+
 # ----------------------------
 # Сайдбар: загрузка и настройки
 # ----------------------------
@@ -207,6 +213,11 @@ with st.sidebar:
     st.divider()
     st.subheader("Фильтры")
     min_bids_pair = st.number_input("Минимум ставок для пары диспетчер-водитель", min_value=1, max_value=100, value=1, step=1)
+    exclude_non_positive_profit = st.checkbox(
+        "Не учитывать ставки с неположительным профитом",
+        value=False,
+        help="При включении из расчётов исключаются ставки с профитом ≤ 0.",
+    )
 
 # ----------------------------
 # Загрузка данных
@@ -248,6 +259,9 @@ if df_raw is not None:
         df = df.loc[m].copy()
     if selected_dispatchers:
         df = df[df["dispatcher_name"].isin(selected_dispatchers)].copy()
+
+    if exclude_non_positive_profit:
+        df = filter_non_positive_profit(df)
 
     if df.empty:
         st.warning("После применения фильтров данных не осталось.")
