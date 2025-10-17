@@ -57,6 +57,16 @@ COLUMN_ALIASES = {
 
 REQUIRED_COLS = list(COLUMN_ALIASES.keys())
 
+UNITS_COLUMN_ALIASES = {
+    "unit_number": ["Unit #", "Unit"],
+    "status": ["Status"],
+    "driver_name": ["Driver Name"],
+    "notes": ["Notes"],
+    "available_data": ["Available Data", "Last Active"],
+}
+
+UNITS_REQUIRED_COLS = list(UNITS_COLUMN_ALIASES.keys())
+
 NY_TZ = "America/New_York"
 
 @st.cache_data(show_spinner=False)
@@ -196,12 +206,124 @@ def filter_non_positive_profit(df: pd.DataFrame) -> pd.DataFrame:
 
     return df[df["profit"] > 0].copy()
 
+
+def preprocess_units(df_in: pd.DataFrame) -> pd.DataFrame:
+    df = df_in.copy()
+
+    cols_map = {}
+    lower_map = {c.lower().strip(): c for c in df.columns}
+    for dest, aliases in UNITS_COLUMN_ALIASES.items():
+        for alias in aliases:
+            lk = alias.lower().strip()
+            if lk in lower_map:
+                cols_map[lower_map[lk]] = dest
+                break
+    df = df.rename(columns=cols_map)
+
+    missing = [dest for dest in UNITS_REQUIRED_COLS if dest not in df.columns]
+    if missing:
+        missing_display = [UNITS_COLUMN_ALIASES[m][0] for m in missing]
+        raise ValueError(
+            f"В таблице юнитов отсутствуют обязательные колонки: {missing_display}"
+        )
+
+    df["unit_number"] = df["unit_number"].astype(str).str.strip()
+    df["status"] = df["status"].fillna("").astype(str).str.strip()
+    df["driver_name"] = df["driver_name"].astype(str).str.strip()
+    df["notes"] = df["notes"].fillna("").astype(str).str.strip()
+    df["available_data"] = df["available_data"].fillna("").astype(str).str.strip()
+
+    mask_status = df["status"].ne("") & ~df["status"].str.lower().eq("retired")
+    df = df.loc[mask_status].copy()
+
+    df["available_date"] = pd.to_datetime(
+        df["available_data"].str[:10], errors="coerce"
+    ).dt.date
+    df["available_date_str"] = df["available_data"].str[:10]
+
+    return df
+
+
+def get_active_units(
+    df_units: pd.DataFrame, df_bids: pd.DataFrame, start_date, end_date
+) -> pd.DataFrame:
+    if start_date is None or end_date is None:
+        return pd.DataFrame(
+            columns=[
+                "Unit #",
+                "Driver Name",
+                "Notes",
+                "Available Data",
+                "Bids in Period",
+            ]
+        )
+
+    df_units = df_units.copy()
+
+    # 🟢 Исправленный фильтр: без ограничения сверху
+    active_mask = (
+        df_units["available_date"].notna()
+        & (df_units["available_date"] >= start_date)
+    )
+    df_units = df_units.loc[active_mask].copy()
+
+    if df_units.empty:
+        return pd.DataFrame(
+            columns=[
+                "Unit #",
+                "Driver Name",
+                "Notes",
+                "Available Data",
+                "Bids in Period",
+            ]
+        )
+
+    # Считаем количество ставок по unit
+    bids_counts = (
+        df_bids.assign(unit_clean=df_bids["unit"].fillna("").astype(str).str.strip())
+        .groupby("unit_clean")["user_dispatch_id"]
+        .count()
+    )
+
+    df_units["Bids in Period"] = (
+        df_units["unit_number"].map(bids_counts).fillna(0).astype(int)
+    )
+
+    result = df_units[
+        [
+            "unit_number",
+            "driver_name",
+            "notes",
+            "available_date_str",
+            "Bids in Period",
+        ]
+    ].rename(
+        columns={
+            "unit_number": "Unit #",
+            "driver_name": "Driver Name",
+            "notes": "Notes",
+            "available_date_str": "Available Data",
+        }
+    )
+
+    result = result.sort_values("Bids in Period", ascending=False).reset_index(drop=True)
+
+    return result
+
 # ----------------------------
 # Сайдбар: загрузка и настройки
 # ----------------------------
 with st.sidebar:
     st.header("⚙️ Настройки и данные")
     up = st.file_uploader("Загрузите CSV/TSV/XLSX с логами", type=["csv", "tsv", "txt", "xlsx", "xls"])
+
+    st.subheader("Таблица юнитов")
+    units_up = st.file_uploader(
+        "Загрузите CSV/TSV/XLSX с юнитами",
+        type=["csv", "tsv", "txt", "xlsx", "xls"],
+        key="units_file_uploader",
+        help="Используется для расчёта активных юнитов.",
+    )
 
     st.divider()
     convert_time = st.checkbox(
@@ -253,6 +375,7 @@ if df_raw is not None:
         selected_dispatchers = st.multiselect("Выберите диспетчеров", dispatchers, default=dispatchers)
 
     # Применим фильтры
+    start_d, end_d = None, None
     if date_range:
         start_d, end_d = date_range if isinstance(date_range, tuple) else (date_range, date_range)
         m = (df["date_ny"] >= start_d) & (df["date_ny"] <= end_d)
@@ -304,6 +427,40 @@ if df_raw is not None:
 
     # Агрегации
     agg_pair, agg_disp, daily = aggregate_tables(df, min_bids_pair=min_bids_pair)
+
+    # ----------------------------
+    # АКТИВНЫЕ ЮНИТЫ
+    # ----------------------------
+    st.subheader("Активные юниты за выбранный период")
+    if units_up is None:
+        st.info("Загрузите таблицу юнитов в сайдбаре, чтобы увидеть активные юниты.")
+    else:
+        df_units_raw = load_table(units_up.getvalue(), units_up.name)
+        try:
+            df_units = preprocess_units(df_units_raw)
+        except Exception as exc:
+            st.error(f"Ошибка обработки таблицы юнитов: {exc}")
+        else:
+            active_units = get_active_units(df_units, df, start_d, end_d)
+            if active_units.empty:
+                st.info("За выбранный период активных юнитов не найдено.")
+            else:
+                c_units1, c_units2 = st.columns(2)
+                with c_units1:
+                    st.metric("Количество активных юнитов", int(active_units.shape[0]))
+                with c_units2:
+                    st.metric(
+                        "Общее число ставок на активные юниты",
+                        int(active_units["Bids in Period"].sum()),
+                    )
+
+                st.dataframe(active_units, use_container_width=True)
+                st.download_button(
+                    "⬇️ Скачать активные юниты (CSV)",
+                    data=df_to_csv_bytes(active_units),
+                    file_name="active_units.csv",
+                    mime="text/csv",
+                )
 
     # ----------------------------
     # КЛЮЧЕВЫЕ СВОДКИ
